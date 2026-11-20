@@ -1,0 +1,101 @@
+name: Claude Relay
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt untuk Claude"
+        required: true
+        default: "Halo Claude, siapa kamu dan model apa yang kamu gunakan? Jawab singkat."
+
+jobs:
+  run-claude:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+      - name: Restore Claude session from secret
+        env:
+          CLAUDE_SESSION_JSON: ${{ secrets.CLAUDE_SESSION_JSON }}
+        run: |
+          if [ -n "$CLAUDE_SESSION_JSON" ]; then
+            case "$CLAUDE_SESSION_JSON" in
+              GZB64:*)
+                printf '%s' "${CLAUDE_SESSION_JSON#GZB64:}" | base64 -d | gunzip > session_claude.json
+                echo "Session restored from secret (compressed)."
+                ;;
+              *)
+                printf '%s' "$CLAUDE_SESSION_JSON" > session_claude.json
+                echo "Session restored from secret."
+                ;;
+            esac
+          fi
+      - name: Install & Setup Official Cloudflare WARP SOCKS5 Tunnel
+        run: |
+          echo "Memasang Cloudflare WARP client resmi..."
+          export DEBIAN_FRONTEND=noninteractive
+          curl -fsSL -o /tmp/warp.deb https://pkg.cloudflareclient.com/pool/jammy/main/c/cloudflare-warp/cloudflare-warp_2024.11.309.0_amd64.deb || true
+          if [ -f /tmp/warp.deb ] && [ $(stat -c%s /tmp/warp.deb) -gt 1000000 ]; then
+            sudo dpkg -i /tmp/warp.deb || true
+          else
+            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ jammy main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+            sudo apt-get update -y -o Dir::Etc::sourcelist="sources.list.d/cloudflare-client.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"
+            sudo apt-get install -y --no-install-recommends cloudflare-warp
+          fi
+          sudo systemctl start warp-svc
+          sleep 1
+          warp-cli --accept-tos registration new || warp-cli --accept-tos register || true
+          warp-cli --accept-tos mode proxy || true
+          warp-cli --accept-tos proxy port 40000 || true
+          warp-cli --accept-tos connect || true
+          sleep 2
+          warp-cli --accept-tos status || true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fast Setup Patchright & Google Chrome Official
+        run: |
+          pip install --no-cache-dir patchright requests
+          # Pastikan Google Chrome Stable resmi terpasang
+          if ! command -v google-chrome &> /dev/null; then
+            wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+            sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq google-chrome-stable
+          fi
+          echo "Google Chrome version: $(google-chrome --version)"
+      - name: Run Claude Engine with Patchright C++ Stealth
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROXY_URL: ${{ secrets.WEBSHARE_PROXY_URL }}
+          CLAUDE_KEEPALIVE: ${{ github.event_name == 'schedule' }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          PROMPT_VAL="${{ github.event.inputs.prompt }}"
+          if [ -z "$PROMPT_VAL" ]; then
+            PROMPT_VAL="Halo Claude, siapa kamu dan apa modelmu?"
+          fi
+          xvfb-run -a python -u claude_engine.py "$PROMPT_VAL"
+      - name: Save Claude session to secret
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -f session_claude.json ]; then
+            python3 -c "import gzip,base64; d=open('session_claude.json','rb').read(); open('session_claude_clean.json','w').write('GZB64:'+base64.b64encode(gzip.compress(d,9)).decode())"
+            if [ $(wc -c < session_claude_clean.json) -gt 49152 ]; then
+              python3 -c "import json; f=open('session_claude.json'); d=json.load(f); f.close(); open('session_claude_clean.json','w').write(json.dumps({'cookies': d.get('cookies', []), 'origins': []}))"
+              echo "Compressed state still too big, falling back to cookies-only."
+            fi
+            gh secret set CLAUDE_SESSION_JSON --repo ciroxtreme/cdtt < session_claude_clean.json
+            echo "Full session saved to secret (compressed)."
+            rm -f session_claude.json session_claude_clean.json
+          fi
